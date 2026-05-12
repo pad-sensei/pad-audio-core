@@ -2404,7 +2404,20 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
   }
 
   _noteOn(midi, velocity, outputGain) {
+    // 2026-05-12: 73 鍵 (Rhodes 実機音域 E1-E7 / MIDI 28-100) 範囲外 silent return。
+    // Web 版は midi-input.js (RHODES_MIN_MIDI=28 / RHODES_MAX_MIDI=100) で gate 済だが、
+    // worklet 直接呼ばれる場合の defense in depth (Plugin との対称性も維持)。
+    if (midi < 28 || midi > 100) return;
+
     var fs = this.fs;
+
+    // 2026-05-12: Clear sustain-pending bit on retrigger (Codex P2 fix).
+    // Without this clear, pedalDown → noteOff → noteOn 再押下 → pedalUp で
+    // setSustain(false) が sustainPending[midi]==1 を見て noteOff(midi) を呼び、
+    // まだ押している voice まで release してしまう。 retrigger 時点で
+    // 「このキーは今 held」なので pending を必ず 0 にする。古い voice は
+    // そのまま自然 decay (新 voice slot で起動、簡略 physical model 維持)。
+    this.sustainPending[midi & 0x7f] = 0;
 
     // Find free voice or steal oldest
     var vi = -1;
@@ -3095,9 +3108,10 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
     if (springCount > 1) wetSum /= springCount;
     var gainFinal = this.v4aGain * this.reverbPot * this.springReturnGain;
     // 2026-04-12 Stereo tap: Accutronics 4AB3C1B dual spring natural L/R
-    // decorrelation. Consumed by stereo output stage after tremolo.
-    // STEREO toggle: when disabled, both channels receive the mono sum.
-    if (springCount >= 2 && this.springStereoEnabled) {
+    // decorrelation. Consumed by stereo output stage pre-tremolo.
+    // 2026-05-12: springStereoEnabled 廃止 (うりなみさん明示「リバーブは常にステレオ」)。
+    // 常に L/R 独立 populate。createInlineSpringState は常に 2 tank なので mono fallback は safety only。
+    if (springCount >= 2) {
       this._springWetL = wetTap0 * gainFinal;
       this._springWetR = wetTap1 * gainFinal;
     } else {
@@ -3542,11 +3556,10 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
 
       // === SHARED CHAIN (post-voice sum) ===
 
-      // --- Reverb send chain: HPF → V3 → tilt → LPF × 2 ---
-      var wetSignal = 0;
-      if (this.useSpringReverb && this.springPlacement === 'post_tremolo' && Math.abs(sendSum) > 0.00001) {
-        wetSignal = this._processInlineSpringSample(sendSum);
-      }
+      // 2026-05-12: 旧 post_tremolo 分岐 (`if (useSpringReverb && springPlacement === 'post_tremolo'
+      // && Math.abs(sendSum) > 0.00001)`) を削除。sendSum は Twin removed 2026-04-13 以降ずっと 0
+      // (上の宣言コメント参照) で実行されず、かつ stereo spring 統一化 (line 3785 以降) で
+      // _processInlineSpringSample が必ず一度だけ呼ばれる構造になったため、dead な二重 advance 経路を撤去。
 
       // --- Output routing ---
       var mainOut;
@@ -3575,16 +3588,11 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
           // Keep this distinction explicit. Do not fold Suitcase back into the
           // generic DI/Twin pre_tremolo helper.
           drySum = (drySum / HARP_PARALLEL_DIV) * this.dryBusGain;
-          // --- Spring reverb: Acc1/2 external effect loop (pre-Ge-preamp) ---
-          // Real routing: Acc2 return → Ge preamp. Dry+wet go through amp together.
-          if (this.useSpringReverb && this.springPlacement === 'pre_tremolo') {
-            var scSpringInput = (suitcasePreFxSum / HARP_PARALLEL_DIV) * this.dryBusGain;
-            var scSpringWet = this._processInlineSpringSample(this._getSuitcaseSpringInput(scSpringInput));
-            // Suitcase keeps its own legacy Acc1/2-style serial merge path.
-            // Do not route this through the generic pre_tremolo helper; that path
-            // was the source of multiple routing regressions.
-            drySum += scSpringWet;
-          }
+          // 2026-05-12: Suitcase 内 spring 処理 (旧 Acc1/2 模擬) を削除。
+          // 実機 Suitcase に内蔵リバーブはない (うりなみさん明示)。
+          // Spring は DI/Suitcase 共通で post-amp pre-tremolo の統一経路に集約
+          // (mainOut から _extractSpringExcitation で駆動、_springWetL/R で stereo 加算)。
+          // → 残置されている `_getSuitcaseSpringInput` は dead code (削除候補だが互換性のため残置)。
           ampSig = drySum * this.rhodesLevel * this.suitcasePreFxTrim; // Suitcase pre-preamp trim (voicing, adjustable via Voicing Lab UI)
 
           // --- Germanium preamp (Shockley soft knee, shared chain) ---
@@ -3768,18 +3776,31 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
         mls[1] = mlc[2] * mbOut - mlc[4] * mlOut;
         mechanicalNoiseSum = mlOut;
       }
-      if (this.useSpringReverb && this.springPlacement === 'pre_tremolo' && this.ampType !== 'suitcase') {
-        // DI / Twin pre_tremolo path (Suitcase is handled above in its own shared chain).
-        // Mix the (mono) spring wet into mainOut before tremolo so tremolo modulates dry+wet.
-        mainOut += this._processInlineSpringSample(this._extractSpringExcitation(mainOut));
+      // 2026-05-12: Spring 駆動を DI/Suitcase 共通化 (うりなみさん明示「Suitcase 実機にリバーブなし」)。
+      // mainOut (DI=clean / Suitcase=post-cab) から _extractSpringExcitation で send 信号を作り、
+      // _processInlineSpringSample が _springWetL/R を populate (戻り値破棄、stereo wet は下の
+      // tremolo 段で pre-tremolo 加算)。実機 Suitcase 1969+ stereo 経路 (spring → preamp → tremolo →
+      // speaker L/R) の sprit に従い、spring が tremolo modulation を受けて「揺れる stereo 残響」になる。
+      // reverb off 時は _springWetL/R を 0 clear (旧コードの per-sample unconditional clear と等価、
+      // DC stuck 防止)。
+      if (this.useSpringReverb) {
+        this._processInlineSpringSample(this._extractSpringExcitation(mainOut));
+      } else {
+        this._springWetL = 0;
+        this._springWetR = 0;
       }
-      this._springWetL = 0;
-      this._springWetR = 0;
 
       // Current mechanical-noise path is an acoustic mic layer, not the DI/pickup path.
       // Keep it out of the spring input bus until a true pre-FX shared-noise model exists.
       mainOut += mechanicalNoiseSum;
-      mainOut *= this.rhodesLevel;
+
+      // 2026-05-12: stereo spring wet を pre-tremolo で加算 (Rhodes 一貫 stereo identity、
+      // Accutronics 4AB3C1B dual-spring natural L/R decorrelation × Peterson Vactrol stereo tremolo)。
+      // rhodesLevel は spring 加算後にかける (PU LEVEL=0 で reverb tail も含めて mute される、
+      // 旧 pre_tremolo DI 経路と同じ behavior。Codex P2 fix 2026-05-12)。
+      var mainOutL = (mainOut + this._springWetL) * this.rhodesLevel;
+      var mainOutR = (mainOut + this._springWetR) * this.rhodesLevel;
+
       // --- Stereo output: Peterson Vactrol Stereo Tremolo (incandescent + CdS) ---
       // Shared across DI and Suitcase: the Vactrol physics model is superior
       // to the legacy Web Audio sine tremolo. One engine, two modes.
@@ -3817,18 +3838,12 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
         var oneMinusE = 1.0 - effectiveD;
         var gainL = oneMinusE + effectiveD * this.cdsStateL;
         var gainR = oneMinusE + effectiveD * this.cdsStateR;
-        outSampleL = mainOut * gainL;
-        outSampleR = mainOut * gainR;
+        outSampleL = mainOutL * gainL;
+        outSampleR = mainOutR * gainR;
       } else {
-        outSampleL = mainOut;
-        outSampleR = mainOut;
+        outSampleL = mainOutL;
+        outSampleR = mainOutR;
       }
-
-      // 2026-04-12 Spring reverb wet — stereo, parallel to tremolo/amp chain.
-      // Accutronics 4AB3C1B dual-spring: tank[0] → L, tank[1] → R natural
-      // decorrelation. うりなみさん: 「もっとふわっと広がる感じ」実装の第一歩。
-      outSampleL += this._springWetL;
-      outSampleR += this._springWetR;
 
       outSampleL *= finalOutputGain;
       outSampleR *= finalOutputGain;
