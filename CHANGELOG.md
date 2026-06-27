@@ -40,6 +40,24 @@ consumer が何を smoke test するかは各 consumer の `CLAUDE.md` を参照
 
 # 履歴
 
+## [2026-06-27] {pending-sha} — Pad Sensei MK1 v0.22 physical engine voicing port
+
+### Feature
+- `epiano-worklet-processor.js` に Pad Sensei MK1 v0.22 相当の物理エンジン調整を移植:
+  - Zener 型の周波数依存 modal damping
+  - mode 5 を主対象にした高次 mode decay tuning
+  - velocity 依存の dynamic tine drive
+  - pickup symmetry / distance の register voicing
+  - bass PU position drive boost
+  - per-key high register compensation
+  - low bass post-pickup trim
+  - CdS tremolo の時定数と stereo width 調整
+  - final hard clip を asymmetric soft clip に置換
+
+### BREAKING なし
+- Message API / schemaVersion / noteOn signature は変更なし。
+- 音色は大きく変わるため、consumer bump 後は耳判定と release-gates を必須にする。
+
 
 ## [2026-04-27] {pending-sha} — autoFilterVol 追加 (output trim, アンプ前段過大入力回避)
 

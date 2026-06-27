@@ -23,6 +23,14 @@ var MAX_VOICES = 32;
 var LUT_SIZE = 1024;
 var LUT_MASK = LUT_SIZE - 1;
 var TWO_PI = 2 * Math.PI;
+var SOFT_CLIP_DRIVE = 0.8;
+var SOFT_CLIP_BIAS = 0.4;
+
+function softClipAsym(x) {
+  var biasNorm = Math.tanh(SOFT_CLIP_BIAS / SOFT_CLIP_DRIVE);
+  var y = SOFT_CLIP_DRIVE * (Math.tanh((x + SOFT_CLIP_BIAS) / SOFT_CLIP_DRIVE) - biasNorm);
+  return Math.max(-1.0, Math.min(1.0, y));
+}
 
 // --- PU EMF Physics (Falaize 2017, eq 21-27) ---
 // EMF = N × [physical constants] × g'(q) × dq/dt
@@ -93,6 +101,38 @@ var HARP_PARALLEL_DIV = 3.0;
 // --- Q-value table (Shear 2011, 1974 Mark I) ---
 var Q_TABLE_MIDI = [39,51,59,60,61,62,64,75,87];
 var Q_TABLE_VAL  = [949,731,1101,1238,1040,1156,1520,2175,1761];
+
+// --- Pad Sensei MK1 v0.22 modal damping / pickup drive voicing ---
+// Zener-style frequency-dependent loss: keep the bell modes alive, but let the
+// high problem modes decay faster. The weights are intentionally narrow; the
+// fifth mode is the main harshness target after ear tuning.
+var ZENER_DELTA_EFF = 2.4e-3;
+var ZENER_FLOOR_Q_SCALE = 2.5;
+var ZENER_FPEAK_LOW = 6000.0;
+var ZENER_FPEAK_HIGH = 12000.0;
+var MODAL_Q_FLOOR_MIN = 5.0;
+var MODE_ZENER_WEIGHT = [0.0, 0.0, 0.0, 0.0, 0.3];
+
+// Pickup voicing: static treble gap/symmetry shift plus velocity-dependent
+// nonlinear drive. Bass saturation remains in the PU-position drive path.
+var PICKUP_GAP_TREBLE_AMOUNT = 1.6;
+var PICKUP_GAP_A_MAX = 1.6;
+var PICKUP_GAP_KEY_LO = 48;
+var PICKUP_GAP_KEY_HI = 100;
+var TOP_OCTAVE_GAP = 0.25;
+var TOP_OCTAVE_KEY_LO = 88;
+var TOP_OCTAVE_KEY_HI = 100;
+var PICKUP_NONLINEARITY = 0.15;
+var PICKUP_C_MIN_RATIO = 0.7;
+var PICKUP_C_MIN_RATIO_BASS = 0.55;
+var PICKUP_BASS_KEY_LO = 48;
+var PICKUP_MID_HIGH_BOOST = 1.0;
+var PICKUP_BASS_BOOST = 1.8;
+var PICKUP_BASS_DRIVE_BOOST = 1.8;
+var DYNAMIC_TINE_DRIVE_AMT = 0.6;
+var DYNAMIC_TINE_DRIVE_VEL_KNEE = 0.5;
+var DYNAMIC_TINE_DRIVE_KEY_LO = 41;
+var DYNAMIC_TINE_DRIVE_KEY_HI = 60;
 
 // --- Euler-Bernoulli cantilever constants (uniform beam fallback) ---
 var BETAL = [1.8751, 4.6941, 7.8548, 10.9955, 14.1372, 17.2788, 20.4204, 23.5620];
@@ -319,6 +359,58 @@ function interpolateQ(midi) {
   return 1200;
 }
 
+function clamp01(x) {
+  return Math.max(0, Math.min(1, x));
+}
+
+function smoothstep01(x, lo, hi) {
+  if (x <= lo) return 0.0;
+  if (x >= hi) return 1.0;
+  var t = (x - lo) / (hi - lo);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+function zenerFpeak(midi) {
+  var key = Math.max(28, Math.min(100, midi));
+  var t = (key - 28.0) / (100.0 - 28.0);
+  return ZENER_FPEAK_LOW + t * (ZENER_FPEAK_HIGH - ZENER_FPEAK_LOW);
+}
+
+function modalQ(midi, modeFreqHz, modeIndex) {
+  var legacyQ = interpolateQ(midi);
+  var etaFloor = 1.0 / (legacyQ * ZENER_FLOOR_Q_SCALE);
+  var fPeak = zenerFpeak(midi);
+  var x = modeFreqHz / fPeak;
+  var weightIndex = Math.max(0, Math.min(4, modeIndex | 0));
+  var qinvTed = MODE_ZENER_WEIGHT[weightIndex] * ZENER_DELTA_EFF * x / (1.0 + x * x);
+  var q = 1.0 / (etaFloor + qinvTed);
+  return Math.max(MODAL_Q_FLOOR_MIN, q);
+}
+
+function pickupTrebleRamp(midi) {
+  return smoothstep01(midi, PICKUP_GAP_KEY_LO, PICKUP_GAP_KEY_HI);
+}
+
+function dynamicTineDriveBoost(midi, velocity) {
+  var velCurve = smoothstep01(clamp01(velocity), DYNAMIC_TINE_DRIVE_VEL_KNEE, 1.0);
+  var keyGate = smoothstep01(midi, DYNAMIC_TINE_DRIVE_KEY_LO, DYNAMIC_TINE_DRIVE_KEY_HI);
+  return 1.0 + DYNAMIC_TINE_DRIVE_AMT * velCurve * keyGate;
+}
+
+function pickupVoicedSymmetry(baseSymmetry, midi) {
+  var topOctaveRamp = smoothstep01(midi, TOP_OCTAVE_KEY_LO, TOP_OCTAVE_KEY_HI);
+  var a = baseSymmetry + PICKUP_GAP_TREBLE_AMOUNT * pickupTrebleRamp(midi) + TOP_OCTAVE_GAP * topOctaveRamp;
+  return Math.max(0, Math.min(PICKUP_GAP_A_MAX, a));
+}
+
+function pickupVoicedDistance(baseDistance, midi) {
+  var lowBandScale = (midi < PICKUP_BASS_KEY_LO) ? PICKUP_BASS_BOOST : PICKUP_MID_HIGH_BOOST;
+  var scale = 1.0 - PICKUP_NONLINEARITY * lowBandScale;
+  var narrowed = baseDistance * scale;
+  var minRatio = (midi < PICKUP_BASS_KEY_LO) ? PICKUP_C_MIN_RATIO_BASS : PICKUP_C_MIN_RATIO;
+  return Math.max(narrowed, baseDistance * minRatio);
+}
+
 function tineLength(midi) {
   var idx = midi - 21;
   if (idx >= 0 && idx < 88) return TINE_LENGTH_TABLE[idx];
@@ -326,6 +418,26 @@ function tineLength(midi) {
   var key = midi - 20;
   if (key < 1) key = 1; if (key > 88) key = 88;
   return 157 * Math.exp(-0.0249 * (key - 1));
+}
+
+function perKeyVolumeCompensationMul(midi) {
+  var refMidi = 60;
+  if (midi <= refMidi) return 1.0;
+  var L_ref = tineLength(refMidi);
+  var L_midi = tineLength(midi);
+  if (L_midi <= 0) return 1.0;
+  return Math.pow(L_ref / L_midi, 1.0);
+}
+
+function bassOutputTrimMul(midi) {
+  var fullMidi = 48;
+  var refMidi = 60;
+  var minMul = 0.50;
+  if (midi <= fullMidi) return minMul;
+  if (midi >= refMidi) return 1.0;
+  var t = (midi - fullMidi) / (refMidi - fullMidi);
+  var s = t * t * (3.0 - 2.0 * t);
+  return minMul + (1.0 - minMul) * s;
 }
 
 function strikingLine(midi) {
@@ -695,10 +807,8 @@ function tineMagneticVolumeFactor(midi) {
 // bass-only: midi <= 50 (E2 = MIDI 52 の少し下) で 1.2x、midi 50-60 で 1.0 へ taper。
 // midi >= 60 (mid 以上) は不変。
 function tinePuPosBassDriveFactor(midi) {
-  if (midi <= 50) return 1.3;
-  if (midi >= 60) return 1.0;
-  var t = (midi - 50) / 10;
-  return 1.3 * (1 - t) + 1.0 * t;
+  if (midi < PICKUP_BASS_KEY_LO) return 1.3 * PICKUP_BASS_DRIVE_BOOST;
+  return PICKUP_MID_HIGH_BOOST;
 }
 
 // --- Per-key tine vibration amplitude (Euler-Bernoulli cantilever beam) ---
@@ -942,7 +1052,7 @@ function computeTineAmplitude(midi, velocity) {
   // var escNorm = escMm / 25.0;
   // if (result > escNorm) result = escNorm;
 
-  return result;
+  return result * dynamicTineDriveBoost(midi, velocity);
 }
 
 // --- Per-key variation (deterministic pseudo-random) ---
@@ -1759,11 +1869,11 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
                                     // 介さない LFO 直送モードを足す場合のみ意味を持つ。
     this.filamentTempL = 0;         // Filament temperature state (L)
     this.filamentTempR = 0;         // Filament temperature state (R)
-    this.filamentTau = 0.0008;      // 1-pole alpha: τ≈25ms (incandescent pilot lamp thermal)
+    this.filamentTauSec = 0.025;    // incandescent pilot lamp thermal inertia
     this.cdsStateL = 0;             // CdS photocell state (L)
     this.cdsStateR = 0;             // CdS photocell state (R)
-    this.cdsAttack = 0.9965;        // ~6ms (light → low resistance, fast CdS attack)
-    this.cdsRelease = 0.9985;       // ~13ms (dark → high resistance, asymmetric trailing)
+    this.cdsAttackSec = 0.035;      // light → low resistance
+    this.cdsReleaseSec = 0.120;     // dark return, slower CdS tail
     // Suitcase Baxandall EQ (Peterson FR7054 preamp, NE5534, ±15V)
     // Bass shelf ~200Hz, Treble shelf ~2kHz. Flat at center (tsBass/tsTreble=0.5)
     // Range: ±12dB. Uses same tsBass/tsTreble params as Twin tonestack.
@@ -2441,8 +2551,8 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
     var decayScale = (midi >= 0 && midi < 128) ? KEY_VARIATION[kvi + 2] : 1.0;
 
     var f0 = 440 * Math.pow(2, (midi - 69) / 12);
-    var Q = interpolateQ(midi);
-    var tau = Q / (Math.PI * f0);
+    var fundQ = modalQ(midi, f0, 0);
+    var tau = fundQ / (Math.PI * f0);
     var hammer = getHammerParams(midi, velocity);
     var massScale = Math.sqrt(hammer.relMass);
     // Velocity-dependent beam decay: disabled for A/B testing.
@@ -2671,7 +2781,8 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
         beamAmpScale = Math.max(0, 1.0 + R); // R=-0.5 → 0.5, R=-1 → 0
         Reff = 0.1; // use minimal positive R for decay calc
       }
-      var beamTau = tau / (BEAM_FREQ_RATIOS[b] * Reff);
+      var beamQ = modalQ(midi, beamFreq, 2 + b);
+      var beamTau = beamQ / (Math.PI * beamFreq * Reff);
       this.vDecayAlpha[slot] = Math.exp(-this.invFs / Math.max(beamTau * decayScale * velDecayScale, 0.001));
       // Store raw weight temporarily in vAmp (will be overwritten after normalization)
       this.vAmp[slot] = vW * beamAmpScale;
@@ -2854,15 +2965,17 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
     this.vPosScale[vi] = (omega0 / Math.max(vA_fund, 0.01)) * puPosDrive;
     var lverOff = (midi >= 0 && midi < 128) ? KEY_VARIATION[midi * 3] : 0;
     var lhorOff = (midi >= 0 && midi < 128) ? KEY_VARIATION[midi * 3 + 1] : 0;
+    var voicedSymmetry = pickupVoicedSymmetry(this.pickupSymmetry, midi);
+    var voicedDistance = pickupVoicedDistance(this.pickupDistance, midi);
     if (this.pickupType === 'wurlitzer') {
       this.vPuLUT[vi] = computePickupLUT_Wurlitzer(this.pickupDistance);
       this.vPuLUT_h[vi] = null; // no whirling for Wurlitzer (electrostatic, symmetric)
     } else if (this.puModel === 'dipole') {
-      this.vPuLUT[vi] = computePickupLUT_dipole(this.pickupSymmetry, this.pickupDistance, gapMm, qRange, lverOff, lhorOff);
+      this.vPuLUT[vi] = computePickupLUT_dipole(voicedSymmetry, voicedDistance, gapMm, qRange, lverOff, lhorOff);
       this.vPuLUT_h[vi] = null; // dipole has no horizontal LUT
     } else {
-      this.vPuLUT[vi] = computePickupLUT(this.pickupSymmetry, this.pickupDistance, gapMm, qRange, lverOff, lhorOff);
-      this.vPuLUT_h[vi] = computePickupLUT_horizontal(this.pickupSymmetry, this.pickupDistance, gapMm, qRange, lverOff, lhorOff);
+      this.vPuLUT[vi] = computePickupLUT(voicedSymmetry, voicedDistance, gapMm, qRange, lverOff, lhorOff);
+      this.vPuLUT_h[vi] = computePickupLUT_horizontal(voicedSymmetry, voicedDistance, gapMm, qRange, lverOff, lhorOff);
     }
 
     // --- 2D Whirling: horizontal fundamental oscillator (default OFF) ---
@@ -2967,7 +3080,8 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
     this.vDbgSigPeak[vi] = 0;
     this.vDbgSigSqSum[vi] = 0;
     // Tone Balance (per-octave EQ) を voice 出力 gain として保持。未指定で 1.0 (バイパス)。
-    this.vOutputGain[vi] = (outputGain !== undefined && outputGain > 0) ? outputGain : 1.0;
+    var hostOutputGain = (outputGain !== undefined && outputGain > 0) ? outputGain : 1.0;
+    this.vOutputGain[vi] = hostOutputGain * perKeyVolumeCompensationMul(midi) * bassOutputTrimMul(midi);
   }
 
   _setSustain(on) {
@@ -3819,25 +3933,38 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
         var squareSign = this.tremoloPhase < 3.14159 ? 1.0 : 0.0;
         var currentL = squareSign;
         var currentR = 1.0 - squareSign;
+        var sampleRate = this.fs;
+        var onePoleCoef = function(tauSec) {
+          return 1.0 - Math.exp(-1.0 / Math.max(1.0e-6, tauSec * sampleRate));
+        };
+
         // 2. Filament thermal inertia (1-pole LPF, τ≈25ms)
-        this.filamentTempL += this.filamentTau * (currentL - this.filamentTempL);
-        this.filamentTempR += this.filamentTau * (currentR - this.filamentTempR);
+        var filamentCoef = onePoleCoef(this.filamentTauSec);
+        this.filamentTempL += filamentCoef * (currentL - this.filamentTempL);
+        this.filamentTempR += filamentCoef * (currentR - this.filamentTempR);
         // 3. Stefan-Boltzmann: light output L ∝ T² (approximation)
         var lightL = this.filamentTempL * this.filamentTempL;
         var lightR = this.filamentTempR * this.filamentTempR;
         // 4. CdS asymmetric response (attack fast, release slow)
-        var alphaL = lightL > this.cdsStateL ? this.cdsAttack : this.cdsRelease;
-        var alphaR = lightR > this.cdsStateR ? this.cdsAttack : this.cdsRelease;
-        this.cdsStateL += (1 - alphaL) * (lightL - this.cdsStateL);
-        this.cdsStateR += (1 - alphaR) * (lightR - this.cdsStateR);
+        var cdsAttackCoef = onePoleCoef(this.cdsAttackSec);
+        var cdsReleaseCoef = onePoleCoef(this.cdsReleaseSec);
+        var coefL = lightL > this.cdsStateL ? cdsAttackCoef : cdsReleaseCoef;
+        var coefR = lightR > this.cdsStateR ? cdsAttackCoef : cdsReleaseCoef;
+        this.cdsStateL += coefL * (lightL - this.cdsStateL);
+        this.cdsStateR += coefR * (lightR - this.cdsStateR);
         // 5. Depth curve: cubic ease-out makes mid-slider already dramatic
         //    slider=0.4 → effective=0.78 (≈10dB swing)
         //    slider=1.0 → effective=1.0 (full swing, one channel silent)
         var oneMinusD = 1.0 - this.tremoloDepth;
         var effectiveD = 1.0 - oneMinusD * oneMinusD * oneMinusD;
         var oneMinusE = 1.0 - effectiveD;
-        var gainL = oneMinusE + effectiveD * this.cdsStateL;
-        var gainR = oneMinusE + effectiveD * this.cdsStateR;
+        var rawGainL = oneMinusE + effectiveD * this.cdsStateL;
+        var rawGainR = oneMinusE + effectiveD * this.cdsStateR;
+        var tremoloStereoWidth = 1.45;
+        var gainMid = 0.5 * (rawGainL + rawGainR);
+        var gainSide = 0.5 * (rawGainL - rawGainR) * tremoloStereoWidth;
+        var gainL = Math.max(0.0, Math.min(1.0, gainMid + gainSide));
+        var gainR = Math.max(0.0, Math.min(1.0, gainMid - gainSide));
         outSampleL = mainOutL * gainL;
         outSampleR = mainOutR * gainR;
       } else {
@@ -3848,17 +3975,8 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
       outSampleL *= finalOutputGain;
       outSampleR *= finalOutputGain;
 
-      if (outSampleL > 1.0 || outSampleL < -1.0 || outSampleR > 1.0 || outSampleR < -1.0) {
-        if (this._clipCount === undefined) this._clipCount = 0;
-        this._clipCount++;
-        if (this._clipCount < 5) {
-          console.log('[CLIP] outL=' + outSampleL.toFixed(4) + ' outR=' + outSampleR.toFixed(4) + ' diSum=' + diSum.toFixed(4) + ' drySum=' + drySum.toFixed(4));
-        }
-      }
-      if (outSampleL > 0.95) outSampleL = 0.95;
-      if (outSampleL < -0.95) outSampleL = -0.95;
-      if (outSampleR > 0.95) outSampleR = 0.95;
-      if (outSampleR < -0.95) outSampleR = -0.95;
+      outSampleL = softClipAsym(outSampleL);
+      outSampleR = softClipAsym(outSampleR);
 
       outL[i] = outSampleL;
       if (outR !== outL) outR[i] = outSampleR; else outL[i] = outSampleL;
