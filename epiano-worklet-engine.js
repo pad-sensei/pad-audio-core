@@ -20,6 +20,10 @@ var _epw_initPromise = null;  // Promise cache to prevent concurrent init race
 var EpwState = {
   pickupSymmetry: 0.3,
   pickupDistance: 0.5,
+  pickupBassDriveBoost: 1.5,
+  pickupBassBoost: 1.5,
+  pickupBassMinRatio: 0.75,
+  pickupMinRatio: 0.7,
   gapVoicing: 'dyno', // 'factory' | 'dyno' (D-3 A/B 切替)
   fNewEnabled: true,  // F-NEW 磁化体積項 (D-12 2026-04-25 A/B 切替)
   puPosBassDriveEnabled: true, // Step 2: PU 非線形ゾーン到達深さ (D-12 2026-04-25 A/B 切替)
@@ -139,12 +143,22 @@ function _epwSendParams() {
   if (!_epw_node) return;
   // EpState is SSOT (set by audio.js UI + saved preferences). Read directly — no EpwState copy.
   var preset = EP_AMP_PRESETS[EpState.preset] || EP_AMP_PRESETS['Rhodes DI'];
+  function stateOrPreset(key, fallback) {
+    if (typeof EpState[key] === 'number' && EpState[key] !== fallback) return EpState[key];
+    if (preset && typeof preset[key] === 'number') return preset[key];
+    if (typeof EpState[key] === 'number') return EpState[key];
+    return fallback;
+  }
   // Voicing Lab 現在値 (window.EpVoicingLab、未設定なら worklet 側デフォルトを維持)
   var vl = (typeof window !== 'undefined' && window.EpVoicingLab) ? window.EpVoicingLab : null;
   var params = {
     type: 'params',
     pickupSymmetry: EpState.pickupSymmetry,
     pickupDistance: EpState.pickupDistance,
+    pickupBassDriveBoost: stateOrPreset('pickupBassDriveBoost', 1.5),
+    pickupBassBoost: stateOrPreset('pickupBassBoost', 1.5),
+    pickupBassMinRatio: stateOrPreset('pickupBassMinRatio', 0.75),
+    pickupMinRatio: stateOrPreset('pickupMinRatio', 0.7),
     gapVoicing: (typeof EpState.gapVoicing !== 'undefined') ? EpState.gapVoicing : 'dyno',
     fNewEnabled: (typeof EpState.fNewEnabled !== 'undefined') ? EpState.fNewEnabled : true,
     puPosBassDriveEnabled: (typeof EpState.puPosBassDriveEnabled !== 'undefined') ? EpState.puPosBassDriveEnabled : true,

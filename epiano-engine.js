@@ -45,6 +45,10 @@ var _epTonestackFB = null;  // feedback (a coefficients)
 var EpState = {
   pickupSymmetry: 0.3,    // 0..1: voicing (0=on-axis: 2nd harmonic dominant, 1=far off-axis: fundamental dominant)
   pickupDistance: 0.5,     // 0.1..1.0: horizontal gap (closer=more distortion)
+  pickupBassDriveBoost: 1.5,
+  pickupBassBoost: 1.5,
+  pickupBassMinRatio: 0.75,
+  pickupMinRatio: 0.7,
   gapVoicing: 'dyno',      // 'factory' | 'dyno' (D-3 A/B)、worklet 側にも伝播。実際の curve は worklet-processor.js の puGapMm(). fallback engine 側 `_puGapMm` は現状 factory curve 固定 (Codex P2 指摘、将来同期)
   preampGain: 1.0,         // 0.5..5.0: input drive
   tonestackBass: 0.5,      // 0..1
@@ -109,15 +113,27 @@ var _SUITCASE_COMMON = {
 var EP_AMP_PRESETS = {
   'Rhodes Suitcase Clean': Object.assign({}, _SUITCASE_COMMON, {
     // Clean: HPS 会員 default 向け、素直な Rhodes 音。drive 最小、makeup 控えめ。
-    voicingLabDefaults: { gePreampDrive: 1.5, gePreampGain: 1.3, suitcasePreFxTrim: 0.5, jaWetMix: 0 },
+    voicingLabDefaults: { gePreampDrive: 3.5546, gePreampGain: 1.62, suitcasePreFxTrim: 0.19, jaWetMix: 0.0222 },
+    pickupBassDriveBoost: 1.0124,
+    pickupBassBoost: 0.6080,
+    pickupBassMinRatio: 0.8719,
+    pickupMinRatio: 0.70,
   }),
   'Rhodes Suitcase Drive': Object.assign({}, _SUITCASE_COMMON, {
     // Drive: 70年代 records 定番、bark/fat 前面。従来の 'Rhodes Suitcase' 相当。
-    voicingLabDefaults: { gePreampDrive: 2.5, gePreampGain: 1.5, suitcasePreFxTrim: 0.42, jaWetMix: 0 },
+    voicingLabDefaults: { gePreampDrive: 3.3010, gePreampGain: 2.5, suitcasePreFxTrim: 0.5745, jaWetMix: 0.1753 },
+    pickupBassDriveBoost: 1.8751,
+    pickupBassBoost: 1.3560,
+    pickupBassMinRatio: 0.6501,
+    pickupMinRatio: 0.95,
   }),
   'Rhodes Suitcase Vintage': Object.assign({}, _SUITCASE_COMMON, {
     // Vintage: 経年 germanium、J-A saturation 強め、warm/mid 押し出し。
-    voicingLabDefaults: { gePreampDrive: 3.0, gePreampGain: 1.2, suitcasePreFxTrim: 0.35, jaWetMix: 0.5 },
+    voicingLabDefaults: { gePreampDrive: 1.1038, gePreampGain: 2.5, suitcasePreFxTrim: 1.0, jaWetMix: 0.4023 },
+    pickupBassDriveBoost: 1.0453,
+    pickupBassBoost: 1.9521,
+    pickupBassMinRatio: 0.9024,
+    pickupMinRatio: 0.8415,
   }),
   'Rhodes Suitcase Vintage Envelope Filter': Object.assign({}, _SUITCASE_COMMON, {
     // 2026-04-27 urinami: AMP Vintage に Envelope Filter variant (Wah ではなく
@@ -125,7 +141,11 @@ var EP_AMP_PRESETS = {
     // Envelope Filter 効果は host 側 (64PE autoFilter BP) で実装。urinami 後で
     // 実機 voicing 確定 → 値固め直し予定。useCabinet (HPS gate) は
     // _SUITCASE_COMMON 由来。
-    voicingLabDefaults: { gePreampDrive: 3.0, gePreampGain: 1.2, suitcasePreFxTrim: 0.35, jaWetMix: 0.5 },
+    voicingLabDefaults: { gePreampDrive: 1.1038, gePreampGain: 2.5, suitcasePreFxTrim: 1.0, jaWetMix: 0.4023 },
+    pickupBassDriveBoost: 1.0453,
+    pickupBassBoost: 1.9521,
+    pickupBassMinRatio: 0.9024,
+    pickupMinRatio: 0.8415,
   }),
   // Backward compat: localStorage に 'Rhodes Suitcase' が残っている場合
   // audio-persistence.js の migration で 'Rhodes Suitcase Drive' に置換する。
@@ -155,6 +175,10 @@ var EP_AMP_PRESETS = {
     springModDepth: 0.0,
     springHfMix: 0.0,
     springFeedbackScale: 0.9,
+    pickupBassDriveBoost: 1.0066,
+    pickupBassBoost: 1.3091,
+    pickupBassMinRatio: 0.95,
+    pickupMinRatio: 0.70,
     // DI は PU 直接出力。+12dB はクリップ、+6dB は Suitcase と並べて適正。
     // 2026-04-22 第3次: urinami「クリップする所がある」→ +12 → +6 に下げ。
     // 2026-04-25 D-5.2: urinami「2つとも あと 3 dB 上げて」→ +6 → +9 dB
@@ -247,6 +271,25 @@ function computePickupLUT_Rhodes(symmetry, distance, gapScale, qRange) {
     }
   }
   return lut;
+}
+
+function pickupVoicedDistance(baseDistance, midi, bassBoost, bassMinRatio, minRatio) {
+  var base = Math.max(0.01, baseDistance || 0.5);
+  var globalMin = Math.max(0.05, Math.min(1.0, minRatio !== undefined ? minRatio : 0.7));
+  if (midi >= 48) return Math.max(base * globalMin, base);
+
+  var lowBandScale = Math.max(0, Math.min(1, (48 - midi) / 20));
+  var boost = Math.max(0, bassBoost !== undefined ? bassBoost : 1.5);
+  var scale = 1.0 - (0.15 * boost * lowBandScale);
+  var bassMin = Math.max(0.05, Math.min(1.0, bassMinRatio !== undefined ? bassMinRatio : 0.75));
+  return Math.max(base * bassMin, base * scale);
+}
+
+function epPresetOrStateNumber(preset, key, fallback) {
+  if (typeof EpState[key] === 'number' && EpState[key] !== fallback) return EpState[key];
+  if (preset && typeof preset[key] === 'number') return preset[key];
+  if (typeof EpState[key] === 'number') return EpState[key];
+  return fallback;
 }
 
 function computePickupLUT_Wurlitzer(distance) {
@@ -1414,11 +1457,18 @@ function epianoNoteOn(ctx, midi, velocity, masterDest) {
   // tipFactor < 1 (treble): narrow q range → LUT concentrated on center
   // Clamp to reasonable range to avoid LUT resolution issues
   var qRange = Math.max(0.3, Math.min(5.0, tipFactor));
+  var voicedDistance = pickupVoicedDistance(
+    EpState.pickupDistance,
+    midi,
+    epPresetOrStateNumber(preset, 'pickupBassBoost', 1.5),
+    epPresetOrStateNumber(preset, 'pickupBassMinRatio', 0.75),
+    epPresetOrStateNumber(preset, 'pickupMinRatio', 0.7)
+  );
 
   var lastNode = voiceMixer;
   if (preset.pickupType === 'rhodes') {
     // Per-note PU LUT with physical gap and displacement range
-    var noteLUT = computePickupLUT_Rhodes(EpState.pickupSymmetry, EpState.pickupDistance, gapScale, qRange);
+    var noteLUT = computePickupLUT_Rhodes(EpState.pickupSymmetry, voicedDistance, gapScale, qRange);
     var pickupWS = ctx.createWaveShaper();
     pickupWS.curve = noteLUT;
     pickupWS.oversample = 'none';

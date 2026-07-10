@@ -403,12 +403,17 @@ function pickupVoicedSymmetry(baseSymmetry, midi) {
   return Math.max(0, Math.min(PICKUP_GAP_A_MAX, a));
 }
 
-function pickupVoicedDistance(baseDistance, midi) {
-  var lowBandScale = (midi < PICKUP_BASS_KEY_LO) ? PICKUP_BASS_BOOST : PICKUP_MID_HIGH_BOOST;
+function pickupVoicedDistance(baseDistance, midi, bassBoost, bassMinRatio, minRatio) {
+  var base = Math.max(0.01, baseDistance || 0.5);
+  var lowBandScale = (midi < PICKUP_BASS_KEY_LO)
+    ? Math.max(0, bassBoost !== undefined ? bassBoost : PICKUP_BASS_BOOST)
+    : PICKUP_MID_HIGH_BOOST;
   var scale = 1.0 - PICKUP_NONLINEARITY * lowBandScale;
-  var narrowed = baseDistance * scale;
-  var minRatio = (midi < PICKUP_BASS_KEY_LO) ? PICKUP_C_MIN_RATIO_BASS : PICKUP_C_MIN_RATIO;
-  return Math.max(narrowed, baseDistance * minRatio);
+  var narrowed = base * scale;
+  var ratio = (midi < PICKUP_BASS_KEY_LO)
+    ? Math.max(0.05, Math.min(1.0, bassMinRatio !== undefined ? bassMinRatio : PICKUP_C_MIN_RATIO_BASS))
+    : Math.max(0.05, Math.min(1.0, minRatio !== undefined ? minRatio : PICKUP_C_MIN_RATIO));
+  return Math.max(narrowed, base * ratio);
 }
 
 function tineLength(midi) {
@@ -806,8 +811,9 @@ function tineMagneticVolumeFactor(midi) {
 //
 // bass-only: midi <= 50 (E2 = MIDI 52 の少し下) で 1.2x、midi 50-60 で 1.0 へ taper。
 // midi >= 60 (mid 以上) は不変。
-function tinePuPosBassDriveFactor(midi) {
-  if (midi < PICKUP_BASS_KEY_LO) return 1.3 * PICKUP_BASS_DRIVE_BOOST;
+function tinePuPosBassDriveFactor(midi, boost) {
+  var b = (boost !== undefined && isFinite(boost)) ? Math.max(0.1, boost) : PICKUP_BASS_DRIVE_BOOST;
+  if (midi < PICKUP_BASS_KEY_LO) return 1.3 * b;
   return PICKUP_MID_HIGH_BOOST;
 }
 
@@ -1934,6 +1940,10 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
     // TODO: verify with compare_spectra.py against Gabrielli companion files.
     this.pickupSymmetry = 0.50; // urinami-san default: bell sweet spot
     this.pickupDistance  = 0.5;
+    this.pickupBassDriveBoost = 1.5;
+    this.pickupBassBoost = 1.5;
+    this.pickupBassMinRatio = 0.75;
+    this.pickupMinRatio = 0.7;
     this.gapVoicing      = 'dyno'; // 'factory' | 'dyno' (D-3 A/B 切替)
     this.fNewEnabled     = true;   // F-NEW 磁化体積項 A_tine ∝ L (2026-04-25 D-12)
                                    // false にすると vMagFactor=1.0 (旧モデル相当)
@@ -2427,6 +2437,10 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
   _updateParams(msg) {
     if (msg.pickupSymmetry !== undefined) this.pickupSymmetry = msg.pickupSymmetry;
     if (msg.pickupDistance !== undefined) this.pickupDistance = msg.pickupDistance;
+    if (msg.pickupBassDriveBoost !== undefined) this.pickupBassDriveBoost = Math.max(0.1, +msg.pickupBassDriveBoost || 1.5);
+    if (msg.pickupBassBoost !== undefined) this.pickupBassBoost = Math.max(0, +msg.pickupBassBoost || 0);
+    if (msg.pickupBassMinRatio !== undefined) this.pickupBassMinRatio = Math.max(0.05, Math.min(1.0, +msg.pickupBassMinRatio || 0.75));
+    if (msg.pickupMinRatio !== undefined) this.pickupMinRatio = Math.max(0.05, Math.min(1.0, +msg.pickupMinRatio || 0.7));
     if (msg.gapVoicing !== undefined) this.gapVoicing = msg.gapVoicing;
     if (msg.fNewEnabled !== undefined) this.fNewEnabled = !!msg.fNewEnabled;
     if (msg.puPosBassDriveEnabled !== undefined) this.puPosBassDriveEnabled = !!msg.puPosBassDriveEnabled;
@@ -2961,14 +2975,20 @@ class EpianoWorkletProcessor extends AudioWorkletProcessor {
     this.vQRange[vi] = qRange;
     // Step 2 (2026-04-25 D-12): bass で puPos peak を LUT 端寄りに押し込み、
     // PU 非線形飽和を深く起こす (歪み生成)。puPosBassDriveEnabled=false で旧モデル相当。
-    var puPosDrive = this.puPosBassDriveEnabled ? tinePuPosBassDriveFactor(midi) : 1.0;
+    var puPosDrive = this.puPosBassDriveEnabled ? tinePuPosBassDriveFactor(midi, this.pickupBassDriveBoost) : 1.0;
     this.vPosScale[vi] = (omega0 / Math.max(vA_fund, 0.01)) * puPosDrive;
+    var voicedDistance = pickupVoicedDistance(
+      this.pickupDistance,
+      midi,
+      this.pickupBassBoost,
+      this.pickupBassMinRatio,
+      this.pickupMinRatio
+    );
     var lverOff = (midi >= 0 && midi < 128) ? KEY_VARIATION[midi * 3] : 0;
     var lhorOff = (midi >= 0 && midi < 128) ? KEY_VARIATION[midi * 3 + 1] : 0;
     var voicedSymmetry = pickupVoicedSymmetry(this.pickupSymmetry, midi);
-    var voicedDistance = pickupVoicedDistance(this.pickupDistance, midi);
     if (this.pickupType === 'wurlitzer') {
-      this.vPuLUT[vi] = computePickupLUT_Wurlitzer(this.pickupDistance);
+      this.vPuLUT[vi] = computePickupLUT_Wurlitzer(voicedDistance);
       this.vPuLUT_h[vi] = null; // no whirling for Wurlitzer (electrostatic, symmetric)
     } else if (this.puModel === 'dipole') {
       this.vPuLUT[vi] = computePickupLUT_dipole(voicedSymmetry, voicedDistance, gapMm, qRange, lverOff, lhorOff);

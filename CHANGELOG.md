@@ -40,6 +40,17 @@ consumer が何を smoke test するかは各 consumer の `CLAUDE.md` を参照
 
 # 履歴
 
+## [2026-07-10] {pending-sha} — Pad Sensei MK1 v0.26 voicing port
+
+### Feature
+- Pad Sensei MK1 v0.26 の factory preset voicing を `Rhodes DI` / `Rhodes Suitcase Clean` / `Drive` / `Vintage` に反映
+- 低音域の pickup drive / distance voicing を preset ごとに制御できる内部パラメータを追加
+- AudioWorklet と fallback engine の両方で低音域の pickup distance voicing を適用
+
+### BREAKING なし
+- Message API / schemaVersion / noteOn signature は変更なし。
+- 既存 consumer は audio-core submodule を bump するだけで従来通り動作。
+
 ## [2026-06-27] {pending-sha} — Pad Sensei MK1 v0.22 physical engine voicing port
 
 ### Feature
@@ -57,7 +68,6 @@ consumer が何を smoke test するかは各 consumer の `CLAUDE.md` を参照
 ### BREAKING なし
 - Message API / schemaVersion / noteOn signature は変更なし。
 - 音色は大きく変わるため、consumer bump 後は耳判定と release-gates を必須にする。
-
 
 ## [2026-04-27] {pending-sha} — autoFilterVol 追加 (output trim, アンプ前段過大入力回避)
 
