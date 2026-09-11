@@ -14,6 +14,7 @@
 var _epw_node = null;          // AudioWorkletNode
 var _epw_initialized = false;
 var _epw_initPromise = null;  // Promise cache to prevent concurrent init race
+var _epw_sustainOn = false;   // Sticky host state; replayed after async worklet creation
 // V4B, poweramp, cabinet all run inside worklet now (sample-by-sample)
 
 // Current parameters (mirrored for UI reads)
@@ -81,6 +82,11 @@ function epianoWorkletInit(ctx, masterDest) {
 
     // Send initial parameters (also handles routing)
     _epwSendParams();
+
+    // Sustain can arrive before the first note initializes the worklet. Keep the
+    // host-side pedal state sticky and replay it before any deferred first note is
+    // posted, so CC64 ordering is preserved across asynchronous worklet bootstrap.
+    _epw_node.port.postMessage({ type: 'sustain', on: _epw_sustainOn });
 
     // --- Load FDTD attack tables (Phase 5: progressive enhancement) ---
     // Non-blocking: if fetch fails, pure modal synthesis continues.
@@ -237,10 +243,22 @@ function epianoWorkletUpdateParams(params) {
 
 function epianoWorkletNoteOn(ctx, midi, velocity, masterDest, outputGain) {
   if (!_epw_initialized) {
+    var deferredCancel = false;
+    var liveCancel = null;
     epianoWorkletInit(ctx, masterDest).then(function() {
-      epianoWorkletNoteOn(ctx, midi, velocity, masterDest, outputGain);
+      var liveEnvelope = epianoWorkletNoteOn(ctx, midi, velocity, masterDest, outputGain);
+      liveCancel = liveEnvelope && typeof liveEnvelope.cancel === 'function' ? liveEnvelope.cancel : null;
+      // Preserve physical event ordering when NoteOff arrives while addModule() is
+      // still pending. With sustain down the DSP receives noteOn then noteOff and
+      // holds the voice; without sustain it enters the normal release path.
+      if (deferredCancel && liveCancel) liveCancel();
     });
-    return { cancel: function() {} };
+    return {
+      cancel: function() {
+        if (liveCancel) liveCancel();
+        else deferredCancel = true;
+      },
+    };
   }
 
   // Sync all params from EpState (SSOT) on every noteOn.
@@ -280,7 +298,8 @@ function epianoWorkletAllNotesOff() {
 }
 
 function epianoWorkletSetSustain(on) {
+  _epw_sustainOn = !!on;
   if (_epw_node) {
-    _epw_node.port.postMessage({ type: 'sustain', on: !!on });
+    _epw_node.port.postMessage({ type: 'sustain', on: _epw_sustainOn });
   }
 }
