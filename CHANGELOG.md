@@ -223,7 +223,7 @@ consumer が何を smoke test するかは各 consumer の `CLAUDE.md` を参照
 ### Feature
 - **`tinePuPosBassDriveFactor(midi)`** 関数追加: bass の puPos peak を LUT 端寄りに押し込む per-key factor
   - midi <= 50 で 1.3x、midi 50-60 で taper to 1.0x、midi >= 60 で 1.0
-  - 物理対応: 実機 PU の per-pickup voicing (pole 形状 / 磁化分布 / 個別 gap voicing) と等価
+  - 物理対応: 実機 Rhodes の per-pickup voicing (pole 形状 / 磁化分布 / 個別 gap voicing) と等価
 - **`this.vPosScale[vi]` 計算式に乗算**: `vPosScale = (omega0/vA_fund) × tinePuPosBassDriveFactor(midi)`
   - puPos peak が bass で +30%、LUT 端 (qRange 0.45) 寄りへ
   - g'(q) の非線形飽和ゾーンに深く到達 → bass の歪み生成
@@ -233,7 +233,7 @@ consumer が何を smoke test するかは各 consumer の `CLAUDE.md` を参照
 
 ### 設計判断
 - vTineAmp の bass boost (modal 振幅段) は音量も増やすため **却下**
-- vPosScale boost (LUT 入力段) なら **歪みのみ**増えて音量保持 → 採用
+- vPosScale boost (LUT 入力段) なら **歪みのみ** 増えて音量保持 → 採用
 - 物理対応: 実機 PU の voicing と直接対応、tine 自体の物理は不変
 - bass-only 1.3x の理由: 1.4x で puPeak 0.4668 が qRange 0.45 を超え Drive/Vintage preset で過剰、1.3x で puPeak 0.4351 = 安全圏
 
@@ -281,7 +281,7 @@ consumer が何を smoke test するかは各 consumer の `CLAUDE.md` を参照
 
 ### 測定 (Rhodes DI, velocity=1.0, Ableton 表記)
 | Band | F-NEW Off (旧) | F-NEW On (新) | Δ |
-|---|---:|---:|---:|
+|---|---|---|---|
 | bass E1-E2 | -25.86 dB | **-21.80 dB** | **+4.06 dB** ↑ |
 | low/trans C2-C3 | -24.49 | -22.42 | +2.07 |
 | mid C3-C4 | -21.66 | **-21.67** | ~0 (元のまま) |
@@ -562,7 +562,7 @@ urinami 2026-04-22「makeup gain 下げて歪ませる = saturator 的に drive 
   - host `schemaVersion` の minor 部分が `REQUIRED_SCHEMA_MINOR` と違えば `console.warn`（throw せず動作継続）
   - 例: host=`1.1`、required=`1.0` → warn だけ出て機能差異を通知
 - `tools/pre-commit.sh` + `tools/install-hooks.sh` 新規 — *.js / INTERFACE.md 変更時に CHANGELOG entry 必須を機械化
-  - Scope: `*.js` + INTERFACE.md（README.md / typo はノイズ源なので除外）
+  - Scope: `*.js` + `INTERFACE.md`（README.md / typo はノイズ源なので除外）
   - Bypass: `SKIP_CHANGELOG=1 git commit ...`
   - Install: `./tools/install-hooks.sh`（clone 直後に 1 回、各 clone で別途）
 
