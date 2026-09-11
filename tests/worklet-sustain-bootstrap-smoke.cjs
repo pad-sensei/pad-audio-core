@@ -1,4 +1,5 @@
 const fs = require('fs');
+const path = require('path');
 const vm = require('vm');
 
 function assert(condition, message) {
@@ -59,7 +60,8 @@ async function main() {
   };
 
   vm.createContext(context);
-  const source = fs.readFileSync('epiano-worklet-engine.js', 'utf8');
+  const enginePath = path.resolve(__dirname, '..', 'epiano-worklet-engine.js');
+  const source = fs.readFileSync(enginePath, 'utf8');
   vm.runInContext(source, context);
 
   const audioCtx = {
