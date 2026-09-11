@@ -1,0 +1,41 @@
+name: Apply sustain audit follow-up v2
+
+on:
+  push:
+    branches:
+      - fix/sustain-non-worklet-voices
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    if: ${{ !contains(github.event.head_commit.message, '[sustain-audit-followup-v2]') }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/sustain-non-worklet-voices
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Apply audit follow-up
+        run: |
+          set -euo pipefail
+          python3 .github/scripts/apply-sustain-audit-followup-v2.py
+      - name: Verify permanent regression test
+        run: |
+          set -euo pipefail
+          node --check audio-voice.js
+          node tests/sustain-voice-smoke.cjs
+          git diff --check
+      - name: Commit tested product and test changes
+        run: |
+          set -euo pipefail
+          git config user.name 'daikainozaki-cyber'
+          git config user.email 'daikainozaki@gmail.com'
+          git rm .github/workflows/apply-sustain-audit-followup-v2.yml .github/scripts/apply-sustain-audit-followup-v2.py
+          git add audio-voice.js CHANGELOG.md tests/sustain-voice-smoke.cjs
+          git commit -m 'test(audio): preserve sustain contract [sustain-audit-followup-v2]'
+          git push origin HEAD:fix/sustain-non-worklet-voices
