@@ -1,0 +1,151 @@
+name: Apply non-worklet sustain fix
+
+on:
+  push:
+    branches:
+      - fix/sustain-non-worklet-voices
+
+permissions:
+  contents: write
+
+jobs:
+  apply-test-commit:
+    if: ${{ !contains(github.event.head_commit.message, '[sustain-fix-applied]') }}
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: fix/sustain-non-worklet-voices
+          fetch-depth: 0
+
+      - name: Apply sustain fix
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p = Path('audio-voice.js')
+          s = p.read_text()
+
+          old = "const activeVoices = new Map(); // midi → { envelope }\n"
+          new = """const activeVoices = new Map(); // midi → { envelope, satCleanup, engineHandlesSustain }\n// Engines without their own damper implementation (sampler / WebAudioFont /\n// non-worklet fallback) keep released keys here while CC64 is held. The e-piano\n// AudioWorklet still receives NoteOff immediately and owns its sustain internally.\nconst _sustainDeferredNotes = new Set();\n\nfunction _cancelVoiceNow(midi, voice) {\n  const v = voice || activeVoices.get(midi);\n  if (!v) {\n    _sustainDeferredNotes.delete(midi);\n    return false;\n  }\n  try { v.envelope.cancel(); } catch(_){}\n  if (v.satCleanup) setTimeout(v.satCleanup, 2000);\n  activeVoices.delete(midi);\n  _sustainDeferredNotes.delete(midi);\n  return true;\n}\n"""
+          if old not in s: raise SystemExit('activeVoices anchor missing')
+          s = s.replace(old, new, 1)
+
+          old = """  const existing = activeVoices.get(midi);\n  if (existing) {\n    try { existing.envelope.cancel(); } catch(_){}\n    activeVoices.delete(midi);\n  }\n"""
+          new = """  const existing = activeVoices.get(midi);\n  if (existing) {\n    // Re-trigger always replaces the old voice, including one currently held only\n    // by the sustain pedal. Never let a deferred release kill the new attack later.\n    _cancelVoiceNow(midi, existing);\n  }\n"""
+          if old not in s: raise SystemExit('retrigger anchor missing')
+          s = s.replace(old, new, 1)
+
+          old = "  activeVoices.set(midi, { envelope, satCleanup: sat.cleanup });\n"
+          new = """  activeVoices.set(midi, {\n    envelope,\n    satCleanup: sat.cleanup,\n    // Worklet e-piano needs NoteOff immediately; its DSP holds/releases the voice\n    // from epianoWorkletSetSustain(). Other engines need host-side deferral.\n    engineHandlesSustain: !!(AudioState.instrument.epiano && _useEpianoWorklet),\n  });\n"""
+          if old not in s: raise SystemExit('activeVoices set anchor missing')
+          s = s.replace(old, new, 1)
+
+          old = """function noteOff(midi) {\n  const v = activeVoices.get(midi);\n  if (!v) return;\n  try { v.envelope.cancel(); } catch(_){}\n  // Cleanup saturation nodes after fadeout\n  if (v.satCleanup) setTimeout(v.satCleanup, 2000);\n  activeVoices.delete(midi);\n}\n\nfunction noteOffAll() {\n  for (const [midi, v] of [...activeVoices.entries()]) {\n    v.envelope.cancel();\n  }\n  activeVoices.clear();\n  // Kill any lingering WebAudioFont voices not tracked in activeVoices\n  if (wafPlayer) wafPlayer.cancelQueue(audioCtx);\n}\n\n// Sustain pedal (MIDI CC64). Forwards to worklet for physical model mode.\nvar _sustainOn = false;\nfunction setSustain(on) {\n  _sustainOn = !!on;\n  if (_useEpianoWorklet && typeof epianoWorkletSetSustain === 'function') {\n    epianoWorkletSetSustain(_sustainOn);\n  }\n}\n"""
+          new = """function noteOff(midi) {\n  const v = activeVoices.get(midi);\n  if (!v) return;\n\n  if (_sustainOn && !v.engineHandlesSustain) {\n    _sustainDeferredNotes.add(midi);\n    return;\n  }\n\n  // Worklet e-piano receives NoteOff even while sustain is down so its DSP can\n  // move the key into its own sustainPending state. Generic engines release here.\n  _cancelVoiceNow(midi, v);\n}\n\nfunction noteOffAll() {\n  for (const [midi, v] of [...activeVoices.entries()]) {\n    _cancelVoiceNow(midi, v);\n  }\n  _sustainDeferredNotes.clear();\n  // Kill any lingering WebAudioFont voices not tracked in activeVoices\n  if (wafPlayer) wafPlayer.cancelQueue(audioCtx);\n}\n\n// Sustain pedal (MIDI CC64). The e-piano worklet owns damper state internally;\n// engines without a native sustain contract defer host-side NoteOff until pedal-up.\nvar _sustainOn = false;\nfunction setSustain(on) {\n  _sustainOn = !!on;\n  if (_useEpianoWorklet && typeof epianoWorkletSetSustain === 'function') {\n    epianoWorkletSetSustain(_sustainOn);\n  }\n\n  if (!_sustainOn && _sustainDeferredNotes.size > 0) {\n    [..._sustainDeferredNotes].forEach(function(midi) {\n      const v = activeVoices.get(midi);\n      if (v && !v.engineHandlesSustain) _cancelVoiceNow(midi, v);\n      else _sustainDeferredNotes.delete(midi);\n    });\n  }\n}\n"""
+          if old not in s: raise SystemExit('noteOff/sustain anchor missing')
+          s = s.replace(old, new, 1)
+          p.write_text(s)
+
+          c = Path('CHANGELOG.md')
+          cs = c.read_text()
+          marker = '# 履歴\n\n'
+          entry = """# 履歴\n\n## [2026-09-11] {pending-sha} — sustain for non-worklet voices\n\n### Fix\n- CC64 sustain now holds sampler / WebAudioFont / non-worklet fallback voices after physical NoteOff and releases them on pedal-up.\n- Re-triggering a sustained pitch replaces the deferred voice immediately, so a later pedal-up cannot kill the new attack.\n- `noteOffAll()` clears deferred sustain state.\n- E-piano AudioWorklet behavior is unchanged: NoteOff still reaches the DSP immediately and `epianoWorkletSetSustain()` remains authoritative there.\n\n### BREAKING なし\n- Public function signatures and consumer API are unchanged.\n\n"""
+          if marker not in cs: raise SystemExit('CHANGELOG marker missing')
+          c.write_text(cs.replace(marker, entry, 1))
+          PY
+
+      - name: Behavioral sustain smoke test
+        shell: bash
+        run: |
+          set -euo pipefail
+          node --check audio-voice.js
+          node <<'NODE'
+          const fs = require('fs');
+          const vm = require('vm');
+          const cancellations = [];
+          const workletSustain = [];
+          const context = {
+            console,
+            setTimeout: (fn) => { fn(); return 1; },
+            clearTimeout: () => {},
+            document: { addEventListener: () => {}, getElementById: () => null },
+            window: { addEventListener: () => {}, audioCoreConfig: null },
+            masterGain: {},
+            _soundMuted: false,
+            ensureAudioResumed: () => {},
+            _hidePadHint: () => {},
+            triggerAutoFilter: () => {},
+            saveSoundSettings: () => {},
+            audioCtx: { state: 'running', currentTime: 0 },
+            AudioState: { instrument: { epiano: null, sampler: null, data: {} } },
+            _useEpianoWorklet: false,
+            _ensureWafPlayer: () => true,
+            wafPlayer: {
+              queueWaveTable: () => ({ cancel: () => cancellations.push('waf') }),
+              cancelQueue: () => {},
+            },
+            EP_AMP_PRESETS: { 'Rhodes DI': { useCabinet: false } },
+            EpState: { preset: 'Rhodes DI' },
+            epianoReverbSend: { gain: { setValueAtTime: () => {} } },
+            epianoAmpOut: {},
+            epianoDirectOut: {},
+            epianoWorkletNoteOn: () => ({ cancel: () => cancellations.push('worklet-noteoff') }),
+            epianoNoteOn: () => ({ cancel: () => cancellations.push('fallback') }),
+            epianoWorkletSetSustain: on => workletSustain.push(on),
+            AppState: { velThreshold: 0, velDrive: 0, velCompand: 0, velRange: 127 },
+          };
+          vm.createContext(context);
+          const src = fs.readFileSync('audio-voice.js', 'utf8') + `\n;globalThis.__voiceTest={noteOn,noteOff,noteOffAll,setSustain,activeVoices,_sustainDeferredNotes};`;
+          vm.runInContext(src, context);
+          const api = context.__voiceTest;
+
+          // WebAudioFont: key-up while pedal is down must keep the voice alive.
+          api.noteOn(60, 0.8);
+          api.setSustain(true);
+          api.noteOff(60);
+          if (!api.activeVoices.has(60)) throw new Error('generic voice released while sustain was down');
+          if (cancellations.length !== 0) throw new Error('generic envelope cancelled before pedal-up');
+          api.setSustain(false);
+          if (api.activeVoices.has(60)) throw new Error('generic voice survived pedal-up');
+          if (cancellations.join(',') !== 'waf') throw new Error('generic pedal-up did not cancel exactly once');
+
+          // Re-trigger must replace a sustained old voice and not leave stale deferred state.
+          cancellations.length = 0;
+          api.noteOn(61, 0.8);
+          api.setSustain(true);
+          api.noteOff(61);
+          api.noteOn(61, 0.8);
+          if (cancellations.join(',') !== 'waf') throw new Error('retrigger did not replace sustained voice');
+          if (api._sustainDeferredNotes.has(61)) throw new Error('retrigger left stale deferred release');
+          api.noteOffAll();
+          if (api.activeVoices.size !== 0 || api._sustainDeferredNotes.size !== 0) throw new Error('noteOffAll left sustain state');
+
+          // Worklet e-piano: NoteOff must still reach DSP immediately while pedal is down.
+          cancellations.length = 0;
+          context.AudioState.instrument = { epiano: 'Rhodes DI', sampler: null, data: {} };
+          context._useEpianoWorklet = true;
+          api.noteOn(62, 0.8);
+          api.setSustain(true);
+          api.noteOff(62);
+          if (cancellations.join(',') !== 'worklet-noteoff') throw new Error('worklet NoteOff was incorrectly deferred in host');
+          if (api.activeVoices.has(62)) throw new Error('worklet voice remained host-owned after NoteOff');
+          if (workletSustain.at(-1) !== true) throw new Error('worklet sustain state not forwarded');
+          api.setSustain(false);
+          if (workletSustain.at(-1) !== false) throw new Error('worklet pedal-up not forwarded');
+          console.log('sustain behavioral smoke: PASS');
+          NODE
+          git diff --check
+
+      - name: Commit product change and remove one-shot workflow
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'daikainozaki-cyber'
+          git config user.email 'daikainozaki@gmail.com'
+          git add audio-voice.js CHANGELOG.md
+          git rm .github/workflows/apply-sustain-fix.yml
+          git commit -m 'fix(audio): sustain non-worklet voices [sustain-fix-applied]'
+          git push origin HEAD:fix/sustain-non-worklet-voices
