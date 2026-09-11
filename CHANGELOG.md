@@ -40,6 +40,16 @@ consumer が何を smoke test するかは各 consumer の `CLAUDE.md` を参照
 
 # 履歴
 
+## [2026-09-12] {pending-sha} — preserve e-piano sustain through worklet bootstrap
+
+### Fix
+- CC64 received before the first e-piano note now remains sticky on the host and is replayed immediately after AudioWorklet creation, before deferred first-note delivery.
+- A first-note NoteOff that arrives while `audioWorklet.addModule()` is still pending is preserved and replayed after the real NoteOn, keeping physical event ordering intact.
+- Added a permanent bootstrap smoke that covers pedal-down before init → NoteOn → NoteOff → pedal-up.
+
+### BREAKING なし
+- Public function signatures, message schema, preset behavior, and non-worklet sustain behavior are unchanged.
+
 ## [2026-09-11] {pending-sha} — sustain for non-worklet voices
 
 ### Fix
