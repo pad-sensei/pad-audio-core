@@ -40,6 +40,17 @@ consumer が何を smoke test するかは各 consumer の `CLAUDE.md` を参照
 
 # 履歴
 
+## [2026-09-11] {pending-sha} — sustain for non-worklet voices
+
+### Fix
+- CC64 sustain now holds sampler / WebAudioFont / non-worklet fallback voices after physical NoteOff and releases them on pedal-up.
+- Re-triggering a sustained pitch replaces the deferred voice immediately, so a later pedal-up cannot kill the new attack.
+- `noteOffAll()` clears deferred sustain state and now schedules the same delayed saturation-node cleanup used by ordinary NoteOff, closing the previous all-notes-off resource leak.
+- E-piano AudioWorklet behavior is unchanged: NoteOff still reaches the DSP immediately and `epianoWorkletSetSustain()` remains authoritative there.
+
+### BREAKING なし
+- Public function signatures and consumer API are unchanged.
+
 ## [2026-07-10] {pending-sha} — Pad Sensei MK1 v0.26 voicing port
 
 ### Feature

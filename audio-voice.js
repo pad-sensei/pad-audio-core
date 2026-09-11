@@ -44,7 +44,24 @@ function _createVoiceSaturation(velocity) {
 }
 
 // --- Voice management ---
-const activeVoices = new Map(); // midi → { envelope }
+const activeVoices = new Map(); // midi → { envelope, satCleanup, engineHandlesSustain }
+// Engines without their own damper implementation (sampler / WebAudioFont /
+// non-worklet fallback) keep released keys here while CC64 is held. The e-piano
+// AudioWorklet still receives NoteOff immediately and owns its sustain internally.
+const _sustainDeferredNotes = new Set();
+
+function _cancelVoiceNow(midi, voice) {
+  const v = voice || activeVoices.get(midi);
+  if (!v) {
+    _sustainDeferredNotes.delete(midi);
+    return false;
+  }
+  try { v.envelope.cancel(); } catch(_){}
+  if (v.satCleanup) setTimeout(v.satCleanup, 2000);
+  activeVoices.delete(midi);
+  _sustainDeferredNotes.delete(midi);
+  return true;
+}
 
 // Phase 3.0.c1: mute UI is host-owned. SVG icons + DOM updates moved to
 // host-adapter.js. _updateMuteBtn becomes a thin delegator. If host
@@ -77,8 +94,9 @@ function noteOn(midi, velocity, outputGain, _retries) {
   // Kill same note if re-triggered
   const existing = activeVoices.get(midi);
   if (existing) {
-    try { existing.envelope.cancel(); } catch(_){}
-    activeVoices.delete(midi);
+    // Re-trigger always replaces the old voice, including one currently held only
+    // by the sustain pedal. Never let a deferred release kill the new attack later.
+    _cancelVoiceNow(midi, existing);
   }
 
   triggerAutoFilter();
@@ -118,33 +136,55 @@ function noteOn(midi, velocity, outputGain, _retries) {
     }
     return;
   }
-  activeVoices.set(midi, { envelope, satCleanup: sat.cleanup });
+  activeVoices.set(midi, {
+    envelope,
+    satCleanup: sat.cleanup,
+    // Worklet e-piano needs NoteOff immediately; its DSP holds/releases the voice
+    // from epianoWorkletSetSustain(). Other engines need host-side deferral.
+    engineHandlesSustain: !!(AudioState.instrument.epiano && _useEpianoWorklet),
+  });
 }
 
 function noteOff(midi) {
   const v = activeVoices.get(midi);
   if (!v) return;
-  try { v.envelope.cancel(); } catch(_){}
-  // Cleanup saturation nodes after fadeout
-  if (v.satCleanup) setTimeout(v.satCleanup, 2000);
-  activeVoices.delete(midi);
+
+  if (_sustainOn && !v.engineHandlesSustain) {
+    _sustainDeferredNotes.add(midi);
+    return;
+  }
+
+  // Worklet e-piano receives NoteOff even while sustain is down so its DSP can
+  // move the key into its own sustainPending state. Generic engines release here.
+  _cancelVoiceNow(midi, v);
 }
 
 function noteOffAll() {
   for (const [midi, v] of [...activeVoices.entries()]) {
-    v.envelope.cancel();
+    _cancelVoiceNow(midi, v);
   }
-  activeVoices.clear();
+  _sustainDeferredNotes.clear();
   // Kill any lingering WebAudioFont voices not tracked in activeVoices
   if (wafPlayer) wafPlayer.cancelQueue(audioCtx);
 }
 
-// Sustain pedal (MIDI CC64). Forwards to worklet for physical model mode.
+// Sustain pedal (MIDI CC64). The e-piano worklet owns damper state internally;
+// engines without a native sustain contract defer host-side NoteOff until pedal-up.
 var _sustainOn = false;
 function setSustain(on) {
   _sustainOn = !!on;
   if (_useEpianoWorklet && typeof epianoWorkletSetSustain === 'function') {
     epianoWorkletSetSustain(_sustainOn);
+  }
+
+  if (!_sustainOn && _sustainDeferredNotes.size > 0) {
+    [..._sustainDeferredNotes].forEach(function(midi) {
+      const v = activeVoices.get(midi);
+      // Deferred entries should only belong to non-worklet voices, but if state
+      // ever drifts, fail toward release rather than toward a stuck note.
+      if (v) _cancelVoiceNow(midi, v);
+      else _sustainDeferredNotes.delete(midi);
+    });
   }
 }
 
