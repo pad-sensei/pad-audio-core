@@ -1,29 +1,4 @@
-from pathlib import Path
-
-
-def replace_once(path, old, new, label):
-    p = Path(path)
-    s = p.read_text()
-    if old not in s:
-        raise SystemExit(f'{label} anchor missing in {path}')
-    p.write_text(s.replace(old, new, 1))
-
-replace_once(
-    'audio-voice.js',
-    """    [..._sustainDeferredNotes].forEach(function(midi) {\n      const v = activeVoices.get(midi);\n      if (v && !v.engineHandlesSustain) _cancelVoiceNow(midi, v);\n      else _sustainDeferredNotes.delete(midi);\n    });\n""",
-    """    [..._sustainDeferredNotes].forEach(function(midi) {\n      const v = activeVoices.get(midi);\n      // Deferred entries should only belong to non-worklet voices, but if state\n      // ever drifts, fail toward release rather than toward a stuck note.\n      if (v) _cancelVoiceNow(midi, v);\n      else _sustainDeferredNotes.delete(midi);\n    });\n""",
-    'defensive pedal-up release',
-)
-
-replace_once(
-    'CHANGELOG.md',
-    "- `noteOffAll()` clears deferred sustain state.\n",
-    "- `noteOffAll()` clears deferred sustain state and now schedules the same delayed saturation-node cleanup used by ordinary NoteOff, closing the previous all-notes-off resource leak.\n",
-    'noteOffAll changelog',
-)
-
-Path('tests').mkdir(exist_ok=True)
-Path('tests/sustain-voice-smoke.cjs').write_text(r'''const fs = require('fs');
+const fs = require('fs');
 const vm = require('vm');
 
 function createHarness() {
@@ -102,4 +77,3 @@ function assert(condition, message) { if (!condition) throw new Error(message); 
 }
 
 console.log('sustain voice smoke: PASS');
-''')

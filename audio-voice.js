@@ -180,7 +180,9 @@ function setSustain(on) {
   if (!_sustainOn && _sustainDeferredNotes.size > 0) {
     [..._sustainDeferredNotes].forEach(function(midi) {
       const v = activeVoices.get(midi);
-      if (v && !v.engineHandlesSustain) _cancelVoiceNow(midi, v);
+      // Deferred entries should only belong to non-worklet voices, but if state
+      // ever drifts, fail toward release rather than toward a stuck note.
+      if (v) _cancelVoiceNow(midi, v);
       else _sustainDeferredNotes.delete(midi);
     });
   }
